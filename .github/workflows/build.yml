@@ -22,6 +22,9 @@ jobs:
         with:
           gradle-version: '8.7'
 
+      - name: Create gradle.properties
+        run: printf "android.useAndroidX=true\nandroid.nonTransitiveRClass=true\norg.gradle.jvmargs=-Xmx2048m\n" > gradle.properties
+
       - name: Build debug APK
         run: gradle assembleDebug
 
