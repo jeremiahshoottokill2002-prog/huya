@@ -56,6 +56,7 @@ class CameraRenderer(
     private var aTexLoc = 0
     private var uTexMatrixLoc = 0
     private var uModeLoc = 0
+    private var uTimeLoc = 0
     private val texMatrix = FloatArray(16)
 
     private val vertexBuffer: FloatBuffer = floatBufferOf(
@@ -116,6 +117,7 @@ class CameraRenderer(
         aTexLoc = GLES20.glGetAttribLocation(program, "aTexCoord")
         uTexMatrixLoc = GLES20.glGetUniformLocation(program, "uTexMatrix")
         uModeLoc = GLES20.glGetUniformLocation(program, "uMode")
+        uTimeLoc = GLES20.glGetUniformLocation(program, "uTime")
 
         GLES20.glClearColor(0f, 0f, 0f, 1f)
 
@@ -213,6 +215,7 @@ class CameraRenderer(
 
         GLES20.glUniformMatrix4fv(uTexMatrixLoc, 1, false, texMatrix, 0)
         GLES20.glUniform1i(uModeLoc, effectMode)
+        GLES20.glUniform1f(uTimeLoc, (System.nanoTime() % 100_000_000_000L) / 1_000_000_000f)
 
         GLES20.glEnableVertexAttribArray(aPosLoc)
         GLES20.glVertexAttribPointer(aPosLoc, 2, GLES20.GL_FLOAT, false, 0, vertexBuffer)
@@ -279,22 +282,45 @@ class CameraRenderer(
             precision mediump float;
             uniform samplerExternalOES uTexture;
             uniform int uMode;
+            uniform float uTime;
             varying vec2 vTexCoord;
+
+            // 0 Normal  1 Fisheye  2 Concave  3 Wide    4 Mirror
+            // 5 B&W     6 Crisp    7 Smooth   8 Glitch  9 VHS
+            // 10 Ghost  11 Kaleido 12 Invert  13 Pulse
+
+            float rnd(vec2 p) {
+                return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453);
+            }
 
             void main() {
                 vec2 uv = vTexCoord;
 
+                // ---- Lens / geometry stage ----
                 if (uMode == 1 || uMode == 2 || uMode == 3) {
-                    vec2 centered = uv - 0.5;
-                    float r2 = dot(centered, centered);
-                    float scale = 1.0;
-                    if (uMode == 1) scale = 1.0 - 0.55 * r2;
-                    if (uMode == 2) scale = 1.0 + 1.10 * r2;
-                    if (uMode == 3) scale = 1.0 - 0.25 * r2;
-                    uv = 0.5 + centered * scale;
+                    vec2 c = uv - 0.5;
+                    float r2 = dot(c, c);
+                    float s = 1.0;
+                    if (uMode == 1) s = 1.0 - 0.55 * r2;
+                    if (uMode == 2) s = 1.0 + 1.10 * r2;
+                    if (uMode == 3) s = 1.0 - 0.25 * r2;
+                    uv = 0.5 + c * s;
                 }
                 if (uMode == 4) {
                     if (uv.x > 0.5) uv.x = 1.0 - uv.x;
+                }
+                if (uMode == 11) {
+                    // Kaleido: 4-way mirror
+                    uv = vec2(0.5) - abs(uv - vec2(0.5));
+                    uv = vec2(0.5) + (uv - vec2(0.5)) * 1.6;
+                }
+                if (uMode == 8) {
+                    // Glitch: jittering horizontal slice displacement
+                    float band = floor(uv.y * 24.0 + uTime * 9.0);
+                    float n = rnd(vec2(band, floor(uTime * 9.0)));
+                    if (n > 0.78) {
+                        uv.x += (n - 0.89) * 0.35;
+                    }
                 }
 
                 if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
@@ -304,6 +330,7 @@ class CameraRenderer(
 
                 vec4 color = texture2D(uTexture, uv);
 
+                // ---- Color / style stage ----
                 if (uMode == 5) {
                     float g = dot(color.rgb, vec3(0.299, 0.587, 0.114));
                     g = clamp((g - 0.5) * 1.15 + 0.5, 0.0, 1.0);
@@ -329,8 +356,38 @@ class CameraRenderer(
                     }
                     color = sum / 9.0;
                 }
+                if (uMode == 8) {
+                    // Glitch: RGB split
+                    float off = 0.006 + 0.004 * sin(uTime * 13.0);
+                    color.r = texture2D(uTexture, uv + vec2(off, 0.0)).r;
+                    color.b = texture2D(uTexture, uv - vec2(off, 0.0)).b;
+                }
+                if (uMode == 9) {
+                    // VHS: scanlines + grain + chroma shift + warm fade
+                    float scan = 0.88 + 0.12 * sin(uv.y * 900.0 + uTime * 30.0);
+                    float grain = (rnd(uv * uTime) - 0.5) * 0.10;
+                    color.r = texture2D(uTexture, uv + vec2(0.0025, 0.0)).r;
+                    color.b = texture2D(uTexture, uv - vec2(0.0025, 0.0)).b;
+                    color.rgb = color.rgb * scan + grain;
+                    color.rgb = mix(color.rgb, vec3(dot(color.rgb, vec3(0.3, 0.59, 0.11))), 0.25);
+                    color.rgb *= vec3(1.05, 1.0, 0.92);
+                }
+                if (uMode == 10) {
+                    // Ghost: drifting translucent double image
+                    vec2 drift = vec2(0.018 * sin(uTime * 1.8), 0.012 * cos(uTime * 1.3));
+                    vec4 ghost = texture2D(uTexture, clamp(uv + drift, 0.0, 1.0));
+                    color.rgb = max(color.rgb * 0.92, ghost.rgb * 0.75);
+                }
+                if (uMode == 12) {
+                    color.rgb = 1.0 - color.rgb;
+                }
+                if (uMode == 13) {
+                    // Pulse: rhythmic brightness beat (~120 BPM)
+                    float beat = 0.85 + 0.30 * pow(abs(sin(uTime * 6.283 * 1.0)), 8.0);
+                    color.rgb *= beat;
+                }
 
-                gl_FragColor = color;
+                gl_FragColor = clamp(color, 0.0, 1.0);
             }
         """
     }
