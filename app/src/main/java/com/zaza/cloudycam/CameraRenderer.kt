@@ -1,26 +1,31 @@
 package com.zaza.cloudycam
 
 import android.graphics.SurfaceTexture
+import android.opengl.EGL14
+import android.opengl.EGLConfig
+import android.opengl.EGLExt
+import android.opengl.EGLSurface
 import android.opengl.GLES11Ext
 import android.opengl.GLES20
 import android.opengl.GLSurfaceView
+import android.view.Surface
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
-import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
 
 /**
- * Renders the live camera feed onto a full-screen quad and applies
- * GPU lens-distortion effects via a fragment shader.
+ * Renders the live camera feed with GPU lens/color effects.
+ *
+ * KEY FEATURE: dual-pass rendering. Every frame is drawn twice:
+ *   1. To the screen (the preview you see)
+ *   2. To the MediaRecorder's input surface (the video being recorded)
+ * This means the recorded file contains EXACTLY what you see,
+ * effects included.
  *
  * Effect modes:
- *   0 = Normal (no distortion)
- *   1 = Fisheye (edges bulge outward, wide-angle look)
- *   2 = Concave (image pinches inward toward the center)
- *
- * Adding a new effect later = add a new branch in FRAGMENT_SHADER
- * and a new mode number. Nothing else changes.
+ *   0 Normal   1 Fisheye   2 Concave   3 Wide
+ *   4 Mirror   5 B&W       6 Crisp     7 Smooth
  */
 class CameraRenderer(
     private val onSurfaceReady: (SurfaceTexture) -> Unit,
@@ -33,6 +38,18 @@ class CameraRenderer(
     var surfaceTexture: SurfaceTexture? = null
         private set
 
+    // --- Recording state (set from UI thread, consumed on GL thread) ---
+    @Volatile
+    private var recordingEnabled = false
+    @Volatile
+    private var pendingEncoderSurface: Surface? = null
+    private var encoderEglSurface: EGLSurface? = null
+    private var videoWidth = 0
+    private var videoHeight = 0
+
+    private var viewWidth = 0
+    private var viewHeight = 0
+
     private var textureId = 0
     private var program = 0
     private var aPosLoc = 0
@@ -42,7 +59,6 @@ class CameraRenderer(
     private val texMatrix = FloatArray(16)
 
     private val vertexBuffer: FloatBuffer = floatBufferOf(
-        // x, y  (full-screen quad, two triangles as a strip)
         -1f, -1f,
         1f, -1f,
         -1f, 1f,
@@ -56,8 +72,20 @@ class CameraRenderer(
         1f, 1f
     )
 
-    override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
-        // Create the external OES texture that receives camera frames
+    /** Call from UI thread to start mirroring frames into the recorder. */
+    fun startRecording(encoderSurface: Surface, width: Int, height: Int) {
+        pendingEncoderSurface = encoderSurface
+        videoWidth = width
+        videoHeight = height
+        recordingEnabled = true
+    }
+
+    /** Call from UI thread to stop mirroring frames. */
+    fun stopRecording() {
+        recordingEnabled = false
+    }
+
+    override fun onSurfaceCreated(gl: GL10?, config: javax.microedition.khronos.egl.EGLConfig?) {
         val tex = IntArray(1)
         GLES20.glGenTextures(1, tex, 0)
         textureId = tex[0]
@@ -95,6 +123,8 @@ class CameraRenderer(
     }
 
     override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
+        viewWidth = width
+        viewHeight = height
         GLES20.glViewport(0, 0, width, height)
     }
 
@@ -103,6 +133,78 @@ class CameraRenderer(
         st.updateTexImage()
         st.getTransformMatrix(texMatrix)
 
+        // ---- Pass 1: draw to the screen ----
+        GLES20.glViewport(0, 0, viewWidth, viewHeight)
+        drawQuad()
+
+        // ---- Pass 2: draw to the recorder (if recording) ----
+        if (recordingEnabled) {
+            drawToEncoder()
+        } else {
+            releaseEncoderSurfaceIfNeeded()
+        }
+    }
+
+    private fun drawToEncoder() {
+        val display = EGL14.eglGetCurrentDisplay()
+        val context = EGL14.eglGetCurrentContext()
+        val prevDraw = EGL14.eglGetCurrentSurface(EGL14.EGL_DRAW)
+        val prevRead = EGL14.eglGetCurrentSurface(EGL14.EGL_READ)
+
+        if (encoderEglSurface == null) {
+            val target = pendingEncoderSurface ?: return
+            val config = chooseRecordableConfig(display) ?: return
+            encoderEglSurface = EGL14.eglCreateWindowSurface(
+                display, config, target, intArrayOf(EGL14.EGL_NONE), 0
+            )
+            if (encoderEglSurface == EGL14.EGL_NO_SURFACE) {
+                encoderEglSurface = null
+                return
+            }
+        }
+
+        val encSurface = encoderEglSurface ?: return
+        if (!EGL14.eglMakeCurrent(display, encSurface, encSurface, context)) return
+
+        GLES20.glViewport(0, 0, videoWidth, videoHeight)
+        drawQuad()
+        EGLExt.eglPresentationTimeANDROID(display, encSurface, System.nanoTime())
+        EGL14.eglSwapBuffers(display, encSurface)
+
+        // Restore the screen surface
+        EGL14.eglMakeCurrent(display, prevDraw, prevRead, context)
+        GLES20.glViewport(0, 0, viewWidth, viewHeight)
+    }
+
+    private fun releaseEncoderSurfaceIfNeeded() {
+        val surface = encoderEglSurface ?: return
+        val display = EGL14.eglGetCurrentDisplay()
+        EGL14.eglDestroySurface(display, surface)
+        encoderEglSurface = null
+        pendingEncoderSurface = null
+    }
+
+    private fun chooseRecordableConfig(display: android.opengl.EGLDisplay): EGLConfig? {
+        val EGL_RECORDABLE_ANDROID = 0x3142
+        val attribs = intArrayOf(
+            EGL14.EGL_RED_SIZE, 8,
+            EGL14.EGL_GREEN_SIZE, 8,
+            EGL14.EGL_BLUE_SIZE, 8,
+            EGL14.EGL_ALPHA_SIZE, 8,
+            EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
+            EGL_RECORDABLE_ANDROID, 1,
+            EGL14.EGL_NONE
+        )
+        val configs = arrayOfNulls<EGLConfig>(1)
+        val numConfigs = IntArray(1)
+        if (!EGL14.eglChooseConfig(display, attribs, 0, configs, 0, 1, numConfigs, 0)) {
+            return null
+        }
+        if (numConfigs[0] <= 0) return null
+        return configs[0]
+    }
+
+    private fun drawQuad() {
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
         GLES20.glUseProgram(program)
 
@@ -179,26 +281,19 @@ class CameraRenderer(
             uniform int uMode;
             varying vec2 vTexCoord;
 
-            // Modes:
-            // 0 Normal   1 Fisheye   2 Concave   3 Wide
-            // 4 Mirror   5 B&W       6 Crisp (sharpen for talking videos)
-            // 7 Smooth (de-grain / noise reduction for older cameras)
-
             void main() {
                 vec2 uv = vTexCoord;
 
-                // ---- Lens distortions ----
                 if (uMode == 1 || uMode == 2 || uMode == 3) {
                     vec2 centered = uv - 0.5;
                     float r2 = dot(centered, centered);
                     float scale = 1.0;
-                    if (uMode == 1) scale = 1.0 - 0.55 * r2;  // fisheye bulge
-                    if (uMode == 2) scale = 1.0 + 1.10 * r2;  // concave pinch
-                    if (uMode == 3) scale = 1.0 - 0.25 * r2;  // mild wide-angle
+                    if (uMode == 1) scale = 1.0 - 0.55 * r2;
+                    if (uMode == 2) scale = 1.0 + 1.10 * r2;
+                    if (uMode == 3) scale = 1.0 - 0.25 * r2;
                     uv = 0.5 + centered * scale;
                 }
                 if (uMode == 4) {
-                    // Mirror: right half reflects the left half
                     if (uv.x > 0.5) uv.x = 1.0 - uv.x;
                 }
 
@@ -209,15 +304,12 @@ class CameraRenderer(
 
                 vec4 color = texture2D(uTexture, uv);
 
-                // ---- Color / clarity effects ----
                 if (uMode == 5) {
-                    // Black & white with a touch of contrast
                     float g = dot(color.rgb, vec3(0.299, 0.587, 0.114));
                     g = clamp((g - 0.5) * 1.15 + 0.5, 0.0, 1.0);
                     color = vec4(g, g, g, 1.0);
                 }
                 if (uMode == 6) {
-                    // Crisp: unsharp mask — makes faces and talking videos pop
                     vec2 t = vec2(1.0 / 720.0, 1.0 / 1280.0);
                     vec4 blur =
                         texture2D(uTexture, uv + vec2( t.x, 0.0)) +
@@ -228,7 +320,6 @@ class CameraRenderer(
                     color = clamp(color + (color - blur) * 0.9, 0.0, 1.0);
                 }
                 if (uMode == 7) {
-                    // Smooth: 3x3 soft average — hides grain and noise
                     vec2 t = vec2(1.0 / 720.0, 1.0 / 1280.0);
                     vec4 sum = vec4(0.0);
                     for (int x = -1; x <= 1; x++) {
