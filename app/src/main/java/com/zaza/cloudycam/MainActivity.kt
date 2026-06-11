@@ -119,14 +119,26 @@ class MainActivity : ComponentActivity() {
             maybeStartCamera() // rebind with new quality
         }
 
-        val buttonRow = LinearLayout(this).apply {
+        val topRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
             addView(effectButton, lpWrap())
             addView(zoomButton, lpWrap())
             addView(qualityButton, lpWrap())
             addView(flipButton, lpWrap())
-            addView(recordButton, lpWrap())
+        }
+
+        val buttonRow = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            addView(topRow, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ))
+            addView(recordButton, LinearLayout.LayoutParams(
+                dp(200),
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(8) })
         }
 
         val root = FrameLayout(this).apply {
