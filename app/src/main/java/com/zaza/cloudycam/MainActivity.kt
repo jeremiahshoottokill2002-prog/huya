@@ -3,10 +3,13 @@ package com.zaza.cloudycam
 import android.Manifest
 import android.content.ContentValues
 import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.graphics.Color
+import android.media.MediaRecorder
 import android.opengl.GLSurfaceView
 import android.os.Build
 import android.os.Bundle
+import android.os.Environment
 import android.provider.MediaStore
 import android.view.Gravity
 import android.view.Surface
@@ -20,14 +23,8 @@ import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
-import androidx.camera.video.MediaStoreOutputOptions
-import androidx.camera.video.Quality
-import androidx.camera.video.QualitySelector
-import androidx.camera.video.Recorder
-import androidx.camera.video.Recording
-import androidx.camera.video.VideoCapture
-import androidx.camera.video.VideoRecordEvent
 import androidx.core.content.ContextCompat
+import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Locale
 
@@ -42,8 +39,9 @@ class MainActivity : ComponentActivity() {
     private lateinit var qualityButton: Button
 
     private var camera: Camera? = null
-    private var videoCapture: VideoCapture<Recorder>? = null
-    private var activeRecording: Recording? = null
+    private var mediaRecorder: MediaRecorder? = null
+    private var outputFile: File? = null
+    private var isRecording = false
 
     private var surfaceReady = false
     private var permissionsGranted = false
@@ -56,7 +54,6 @@ class MainActivity : ComponentActivity() {
         "Mirror", "B&W", "Crisp", "Smooth"
     )
     private val qualityNames = arrayOf("HD", "FHD", "SD")
-    private val qualityValues = arrayOf(Quality.HD, Quality.FHD, Quality.SD)
     private var qualityIndex = 0
 
     private val permissionLauncher = registerForActivityResult(
@@ -78,11 +75,12 @@ class MainActivity : ComponentActivity() {
                 surfaceReady = true
                 runOnUiThread { maybeStartCamera() }
             },
-            requestRender = { glView.requestRender() }
+            requestRender = { if (::glView.isInitialized) glView.requestRender() }
         )
 
         glView = GLSurfaceView(this).apply {
             setEGLContextClientVersion(2)
+            setEGLConfigChooser(8, 8, 8, 8, 0, 0)
             setRenderer(renderer)
             renderMode = GLSurfaceView.RENDERMODE_WHEN_DIRTY
         }
@@ -99,6 +97,10 @@ class MainActivity : ComponentActivity() {
         }
 
         flipButton = makeButton("🔄") {
+            if (isRecording) {
+                Toast.makeText(this, "Stop recording first", Toast.LENGTH_SHORT).show()
+                return@makeButton
+            }
             lensFacing = if (lensFacing == CameraSelector.LENS_FACING_BACK)
                 CameraSelector.LENS_FACING_FRONT else CameraSelector.LENS_FACING_BACK
             zoomIndex = 0
@@ -106,18 +108,17 @@ class MainActivity : ComponentActivity() {
             maybeStartCamera()
         }
 
-        recordButton = makeButton("● REC") { toggleRecording() }
-        recordButton.setTextColor(Color.RED)
-
         qualityButton = makeButton("🎞 HD") {
-            if (activeRecording != null) {
+            if (isRecording) {
                 Toast.makeText(this, "Stop recording first", Toast.LENGTH_SHORT).show()
                 return@makeButton
             }
             qualityIndex = (qualityIndex + 1) % qualityNames.size
             qualityButton.text = "🎞 " + qualityNames[qualityIndex]
-            maybeStartCamera() // rebind with new quality
         }
+
+        recordButton = makeButton("● REC") { toggleRecording() }
+        recordButton.setTextColor(Color.RED)
 
         val topRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -128,23 +129,29 @@ class MainActivity : ComponentActivity() {
             addView(flipButton, lpWrap())
         }
 
-        val buttonRow = LinearLayout(this).apply {
+        val buttonColumn = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
-            addView(topRow, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ))
-            addView(recordButton, LinearLayout.LayoutParams(
-                dp(200),
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply { topMargin = dp(8) })
+            addView(
+                topRow,
+                LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                )
+            )
+            addView(
+                recordButton,
+                LinearLayout.LayoutParams(
+                    dp(200),
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply { topMargin = dp(8) }
+            )
         }
 
         val root = FrameLayout(this).apply {
             addView(glView)
             addView(
-                buttonRow,
+                buttonColumn,
                 FrameLayout.LayoutParams(
                     FrameLayout.LayoutParams.MATCH_PARENT,
                     FrameLayout.LayoutParams.WRAP_CONTENT,
@@ -181,82 +188,155 @@ class MainActivity : ComponentActivity() {
                 ) { surface.release() }
             }
 
-            val recorder = Recorder.Builder()
-                .setQualitySelector(
-                    QualitySelector.from(
-                        qualityValues[qualityIndex],
-                        androidx.camera.video.FallbackStrategy.lowerQualityOrHigherThan(Quality.SD)
-                    )
-                )
-                .build()
-            videoCapture = VideoCapture.withOutput(recorder)
-
             val selector = CameraSelector.Builder()
                 .requireLensFacing(lensFacing)
                 .build()
 
             try {
                 provider.unbindAll()
-                camera = provider.bindToLifecycle(this, selector, preview, videoCapture)
+                camera = provider.bindToLifecycle(this, selector, preview)
             } catch (e: Exception) {
                 Toast.makeText(this, "Camera error: " + e.message, Toast.LENGTH_LONG).show()
             }
         }, ContextCompat.getMainExecutor(this))
     }
 
+    // ---------- Recording: captures the GL output, effects included ----------
+
+    private fun videoSize(): Pair<Int, Int> {
+        val landscape =
+            resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+        val (w, h) = when (qualityNames[qualityIndex]) {
+            "FHD" -> 1920 to 1080
+            "SD" -> 854 to 480
+            else -> 1280 to 720
+        }
+        return if (landscape) w to h else h to w
+    }
+
+    private fun videoBitrate(): Int = when (qualityNames[qualityIndex]) {
+        "FHD" -> 16_000_000
+        "SD" -> 4_000_000
+        else -> 8_000_000
+    }
+
     private fun toggleRecording() {
-        val capture = videoCapture ?: return
-
-        // Stop if already recording
-        activeRecording?.let {
-            it.stop()
-            activeRecording = null
-            return
+        if (isRecording) {
+            stopRecording()
+        } else {
+            startRecording()
         }
+    }
 
-        val name = "CloudyCam_" + SimpleDateFormat(
-            "yyyyMMdd_HHmmss", Locale.US
-        ).format(System.currentTimeMillis())
-
-        val contentValues = ContentValues().apply {
-            put(MediaStore.Video.Media.DISPLAY_NAME, name)
-            put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/CloudyCam")
-            }
-        }
-
-        val outputOptions = MediaStoreOutputOptions.Builder(
-            contentResolver,
-            MediaStore.Video.Media.EXTERNAL_CONTENT_URI
-        ).setContentValues(contentValues).build()
-
-        val pending = capture.output.prepareRecording(this, outputOptions)
+    private fun startRecording() {
+        val (w, h) = videoSize()
         val hasAudio = ContextCompat.checkSelfPermission(
             this, Manifest.permission.RECORD_AUDIO
         ) == PackageManager.PERMISSION_GRANTED
-        if (hasAudio) pending.withAudioEnabled()
 
-        activeRecording = pending.start(ContextCompat.getMainExecutor(this)) { event ->
-            when (event) {
-                is VideoRecordEvent.Start -> {
-                    recordButton.text = "■ STOP"
-                }
-                is VideoRecordEvent.Finalize -> {
-                    recordButton.text = "● REC"
-                    if (event.hasError()) {
-                        Toast.makeText(
-                            this, "Recording failed: " + event.error, Toast.LENGTH_LONG
-                        ).show()
-                    } else {
-                        Toast.makeText(
-                            this, "Saved to Movies/CloudyCam 🎬", Toast.LENGTH_SHORT
-                        ).show()
-                    }
-                }
-                else -> {}
+        val name = "CloudyCam_" + SimpleDateFormat(
+            "yyyyMMdd_HHmmss", Locale.US
+        ).format(System.currentTimeMillis()) + ".mp4"
+
+        val dir = getExternalFilesDir(Environment.DIRECTORY_MOVIES) ?: filesDir
+        val file = File(dir, name)
+
+        try {
+            @Suppress("DEPRECATION")
+            val recorder = MediaRecorder()
+            if (hasAudio) recorder.setAudioSource(MediaRecorder.AudioSource.MIC)
+            recorder.setVideoSource(MediaRecorder.VideoSource.SURFACE)
+            recorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+            recorder.setOutputFile(file.absolutePath)
+            recorder.setVideoEncodingBitRate(videoBitrate())
+            recorder.setVideoFrameRate(30)
+            recorder.setVideoSize(w, h)
+            recorder.setVideoEncoder(MediaRecorder.VideoEncoder.H264)
+            if (hasAudio) {
+                recorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+                recorder.setAudioSamplingRate(44100)
+                recorder.setAudioEncodingBitRate(128000)
             }
+            recorder.prepare()
+
+            renderer.startRecording(recorder.surface, w, h)
+            recorder.start()
+
+            mediaRecorder = recorder
+            outputFile = file
+            isRecording = true
+            recordButton.text = "■ STOP"
+        } catch (e: Exception) {
+            renderer.stopRecording()
+            mediaRecorder?.release()
+            mediaRecorder = null
+            Toast.makeText(this, "Recording failed: " + e.message, Toast.LENGTH_LONG).show()
         }
+    }
+
+    private fun stopRecording() {
+        val recorder = mediaRecorder ?: return
+        isRecording = false
+        recordButton.text = "● REC"
+
+        renderer.stopRecording()
+
+        try {
+            recorder.stop()
+        } catch (e: Exception) {
+            Toast.makeText(this, "Recording too short", Toast.LENGTH_SHORT).show()
+            recorder.release()
+            mediaRecorder = null
+            outputFile?.delete()
+            outputFile = null
+            return
+        }
+        recorder.release()
+        mediaRecorder = null
+
+        val file = outputFile
+        outputFile = null
+        if (file != null && file.exists()) {
+            saveToGallery(file)
+        }
+    }
+
+    /** Copies the finished video into the phone's gallery (Movies/CloudyCam). */
+    private fun saveToGallery(file: File) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            try {
+                val values = ContentValues().apply {
+                    put(MediaStore.Video.Media.DISPLAY_NAME, file.name)
+                    put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+                    put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/CloudyCam")
+                    put(MediaStore.Video.Media.IS_PENDING, 1)
+                }
+                val uri = contentResolver.insert(
+                    MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values
+                )
+                if (uri != null) {
+                    contentResolver.openOutputStream(uri)?.use { out ->
+                        file.inputStream().use { input -> input.copyTo(out) }
+                    }
+                    values.clear()
+                    values.put(MediaStore.Video.Media.IS_PENDING, 0)
+                    contentResolver.update(uri, values, null, null)
+                    file.delete()
+                    Toast.makeText(this, "Saved to gallery: Movies/CloudyCam 🎬", Toast.LENGTH_SHORT).show()
+                } else {
+                    Toast.makeText(this, "Saved to: " + file.absolutePath, Toast.LENGTH_LONG).show()
+                }
+            } catch (e: Exception) {
+                Toast.makeText(this, "Saved to: " + file.absolutePath, Toast.LENGTH_LONG).show()
+            }
+        } else {
+            Toast.makeText(this, "Saved to: " + file.absolutePath, Toast.LENGTH_LONG).show()
+        }
+    }
+
+    override fun onPause() {
+        super.onPause()
+        if (isRecording) stopRecording()
     }
 
     private fun makeButton(label: String, onClick: () -> Unit): Button =
