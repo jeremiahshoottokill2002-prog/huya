@@ -37,6 +37,8 @@ class MainActivity : ComponentActivity() {
     private lateinit var zoomButton: Button
     private lateinit var flipButton: Button
     private lateinit var qualityButton: Button
+    private lateinit var torchButton: Button
+    private var torchOn = false
 
     private var camera: Camera? = null
     private var mediaRecorder: MediaRecorder? = null
@@ -51,7 +53,9 @@ class MainActivity : ComponentActivity() {
     private val zoomLevels = floatArrayOf(1.0f, 1.5f, 2.0f, 3.0f)
     private val effectNames = arrayOf(
         "Normal", "Fisheye", "Concave", "Wide",
-        "Mirror", "B&W", "Crisp", "Smooth"
+        "Mirror", "B&W", "Crisp", "Smooth",
+        "Glitch", "VHS", "Ghost", "Kaleido",
+        "Invert", "Pulse"
     )
     private val qualityNames = arrayOf("HD", "FHD", "SD")
     private var qualityIndex = 0
@@ -120,12 +124,19 @@ class MainActivity : ComponentActivity() {
         recordButton = makeButton("● REC") { toggleRecording() }
         recordButton.setTextColor(Color.RED)
 
+        torchButton = makeButton("🔦") {
+            torchOn = !torchOn
+            camera?.cameraControl?.enableTorch(torchOn)
+            torchButton.setTextColor(if (torchOn) Color.YELLOW else Color.WHITE)
+        }
+
         val topRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
             addView(effectButton, lpWrap())
             addView(zoomButton, lpWrap())
             addView(qualityButton, lpWrap())
+            addView(torchButton, lpWrap())
             addView(flipButton, lpWrap())
         }
 
@@ -262,6 +273,9 @@ class MainActivity : ComponentActivity() {
             renderer.startRecording(recorder.surface, w, h)
             recorder.start()
 
+            // Lock orientation while recording — prevents sideways/stretched videos
+            requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_LOCKED
+
             mediaRecorder = recorder
             outputFile = file
             isRecording = true
@@ -278,6 +292,7 @@ class MainActivity : ComponentActivity() {
         val recorder = mediaRecorder ?: return
         isRecording = false
         recordButton.text = "● REC"
+        requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR
 
         renderer.stopRecording()
 
